@@ -18,9 +18,14 @@ const cron = require('node-cron');
 const { GoogleGenAI } = require('@google/genai');
 
 const redis = new Redis({
-  url: 'https://meet-gopher-79319.upstash.io',
-  token: 'gQAAAAAAATXXAAIgcDExNjNiMDQ1NzhlMzg0MDY3YTg2MDc2NDYyOGVmYmE3MQ',
+  url: process.env.UPSTASH_URL,
+  token: process.env.UPSTASH_TOKEN,
 });
+
+if (!process.env.UPSTASH_URL || !process.env.UPSTASH_TOKEN) {
+  console.error('Faltan UPSTASH_URL o UPSTASH_TOKEN en las variables de entorno.');
+  process.exit(1);
+}
 
 // Inicializamos Gemini
 const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
