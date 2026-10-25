@@ -1,71 +1,149 @@
 const express = require('express');
-const app = express();
-const PORT = process.env.PORT || 3000;
+const tmi = require('tmi.js');
+const { Redis } = require('@upstash/redis');
+const cron = require('node-cron');
+const { GoogleGenAI } = require('@google/genai');
 
-// Mini servidor web para mantener el servicio activo en la nube 24/7
+// ---------- Configuración ----------
+const PORT = process.env.PORT || 3000;
+const CHANNEL = process.env.CHANNEL_NAME || 'mortalix_zekhmet';
+const STREAM_TZ = process.env.STREAM_TZ || 'UTC'; // debe ser igual que en el Worker
+const CUTOFF = Number(process.env.STREAM_DAY_CUTOFF_HOUR ?? 14);
+const GEMINI_MODEL = process.env.GEMINI_MODEL || 'gemini-3.8-flash';
+
+const { UPSTASH_URL, UPSTASH_TOKEN, GEMINI_API_KEY } = process.env;
+
+if (!UPSTASH_URL || !UPSTASH_TOKEN) {
+  console.error('Faltan UPSTASH_URL o UPSTASH_TOKEN en las variables de entorno.');
+  process.exit(1);
+}
+
+const redis = new Redis({ url: UPSTASH_URL, token: UPSTASH_TOKEN });
+const ai = new GoogleGenAI({ apiKey: GEMINI_API_KEY });
+
+// Usuarios cuyos mensajes no se guardan (bots)
+const IGNORED_USERS = new Set([
+  'nightbot', 'streamelements', 'streamlabs', 'moobot', 'fossabot', 'wizebot'
+]);
+
+// ---------- Fecha del "día de stream" (misma lógica que el Worker) ----------
+function getStreamDateKey(now = new Date()) {
+  const hour = Number(
+    new Intl.DateTimeFormat('en-GB', { timeZone: STREAM_TZ, hour: '2-digit', hour12: false }).format(now)
+  ) % 24;
+  const ref = hour < CUTOFF ? new Date(now.getTime() - 24 * 60 * 60 * 1000) : now;
+  return new Intl.DateTimeFormat('en-CA', { timeZone: STREAM_TZ }).format(ref); // YYYY-MM-DD
+}
+
+// ---------- Cliente de Twitch ----------
+const client = new tmi.Client({ channels: [CHANNEL] });
+
+client.on('connected', (addr, port) => {
+  console.log(`[tmi] Conectado a ${addr}:${port}, escuchando #${CHANNEL}`);
+});
+client.on('disconnected', (reason) => {
+  console.log('[tmi] Desconectado:', reason);
+});
+
+// ---------- Servidor web (mantiene vivo el servicio en Render) ----------
+const app = express();
+
 app.get('/', (req, res) => {
   res.send('El bot de Twitch y los resúmenes están activos 🚀');
+});
+
+app.get('/health', (req, res) => {
+  res.json({
+    ok: true,
+    twitch: client.readyState(),
+    pendientesEnBuffer: buffer.length,
+    streamKey: `stream_chat:${getStreamDateKey()}`
+  });
 });
 
 app.listen(PORT, () => {
   console.log(`Servidor web corriendo en el puerto ${PORT}`);
 });
 
-// --- LÓGICA DEL BOT DE TWITCH, REDIS Y GEMINI ---
-const tmi = require('tmi.js');
-const { Redis } = require('@upstash/redis');
-const cron = require('node-cron');
-const { GoogleGenAI } = require('@google/genai');
-
-const redis = new Redis({
-  url: process.env.UPSTASH_URL,
-  token: process.env.UPSTASH_TOKEN,
-});
-
-if (!process.env.UPSTASH_URL || !process.env.UPSTASH_TOKEN) {
-  console.error('Faltan UPSTASH_URL o UPSTASH_TOKEN en las variables de entorno.');
-  process.exit(1);
+// Auto-ping para que Render no duerma el servicio mientras esté despierto.
+// Para despertarlo si ya se durmió, usa además UptimeRobot / cron-job.org.
+const SELF_URL = process.env.RENDER_EXTERNAL_URL;
+if (SELF_URL) {
+  setInterval(() => {
+    fetch(`${SELF_URL}/health`).catch((e) =>
+      console.error('[keep-alive] Falló el auto-ping:', e.message)
+    );
+  }, 5 * 60 * 1000);
 }
 
-// Inicializamos Gemini
-const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
+// ---------- 1. Memoria inmediata: guardado del chat por lotes ----------
+let buffer = [];
+let flushing = false;
 
-const client = new tmi.Client({
-  channels: ['mortalix_zekhmet']
-});
-
-client.connect().catch(console.error);
-
-function getStreamDateKey() {
-  const now = new Date();
-  if (now.getHours() < 14) {
-    now.setDate(now.getDate() - 1);
-  }
-  return now.toISOString().split('T')[0];
-}
-
-// 1. Memoria Inmediata: Registro de mensajes en tiempo real
-client.on('message', async (target, context, message, self) => {
+client.on('message', (target, context, message, self) => {
   if (self) return;
 
+  const login = String(context.username || '').toLowerCase();
+  if (IGNORED_USERS.has(login)) return;   // ignora bots
+  if (message.startsWith('!')) return;    // ignora comandos (evita guardar claves/URLs)
+
   const username = context['display-name'] || context.username;
-  const logEntry = `${username}: ${message}`;
+  buffer.push(`${username}: ${message}`);
 
-  try {
-    const streamDate = getStreamDateKey();
-    const redisKey = `stream_chat:${streamDate}`;
-
-    await redis.rpush(redisKey, logEntry);
-    await redis.ltrim(redisKey, -2000, -1);
-    await redis.expire(redisKey, 129600);
-
-    console.log(`[Guardado - ${streamDate}] ${logEntry}`);
-  } catch (err) {
-    console.error('Error al guardar en Redis:', err);
-  }
+  if (buffer.length >= 100) flushBuffer();
 });
 
-// 2 & 3. Resumen diario y consolidación a largo plazo
+async function flushBuffer() {
+  if (flushing || buffer.length === 0) return;
+  flushing = true;
+
+  const batch = buffer;
+  buffer = [];
+
+  try {
+    const key = `stream_chat:${getStreamDateKey()}`;
+    const p = redis.pipeline();
+    p.rpush(key, ...batch);
+    p.ltrim(key, -2000, -1);
+    p.expire(key, 129600);
+    await p.exec();
+    console.log(`[Guardado - ${key}] ${batch.length} mensajes`);
+  } catch (err) {
+    // Reintentar en el siguiente ciclo (con tope para no crecer sin límite)
+    buffer = batch.concat(buffer).slice(-5000);
+    console.error('[Redis] Error al guardar:', err);
+  } finally {
+    flushing = false;
+  }
+}
+
+setInterval(flushBuffer, 10 * 1000);
+
+// Al apagarse (Render manda SIGTERM) guardamos lo pendiente
+async function shutdown(signal) {
+  console.log(`[${signal}] Guardando buffer pendiente y cerrando...`);
+  await flushBuffer();
+  process.exit(0);
+}
+process.on('SIGTERM', () => shutdown('SIGTERM'));
+process.on('SIGINT', () => shutdown('SIGINT'));
+
+// ---------- Arranque: verificar Redis y conectar a Twitch ----------
+(async () => {
+  try {
+    await redis.ping();
+    console.log(`[Redis] Conexión OK (${new URL(UPSTASH_URL).hostname})`);
+  } catch (err) {
+    console.error('[Redis] No se pudo conectar:', err);
+  }
+})();
+
+client.connect().catch((err) => {
+  console.error('[tmi] Error al conectar:', err);
+  process.exit(1); // Render reinicia el servicio
+});
+
+// ---------- 2 & 3. Resumen diario y consolidación a largo plazo ----------
 async function resumirStreamAnterior(streamDate) {
   try {
     const redisKey = `stream_chat:${streamDate}`;
@@ -77,7 +155,7 @@ async function resumirStreamAnterior(streamDate) {
     }
 
     const chatTexto = mensajes.join('\n');
-    console.log(`[Resumen] Generando resumen diario con gemini-3.8-flash para el ${streamDate}...`);
+    console.log(`[Resumen] Generando resumen diario con ${GEMINI_MODEL} para el ${streamDate} (${mensajes.length} mensajes)...`);
 
     const promptDiario = `
 Eres un asistente encargado de resumir streams de Twitch para mantener la memoria del canal.
@@ -93,21 +171,19 @@ ${chatTexto}
 `;
 
     const response = await ai.models.generateContent({
-      model: 'gemini-3.8-flash',
+      model: GEMINI_MODEL,
       contents: promptDiario,
     });
 
     const resumenTexto = `[Stream ${streamDate}]:\n${response.text.trim()}`;
 
-    // Guardamos en mediano plazo
     await redis.lpush('resumenes_mediano_plazo', resumenTexto);
-    console.log(`[Resumen] Guardado en la memoria de mediano plazo.`);
+    console.log('[Resumen] Guardado en la memoria de mediano plazo.');
 
-    // Verificamos si alcanzamos 30 resúmenes para consolidar
     const totalResumenes = await redis.llen('resumenes_mediano_plazo');
 
     if (totalResumenes >= 30) {
-      console.log(`[Consolidación] ¡Se alcanzaron 30 resúmenes! Creando memoria a largo plazo...`);
+      console.log('[Consolidación] ¡Se alcanzaron 30 resúmenes! Creando memoria a largo plazo...');
 
       const ultimos30 = await redis.lrange('resumenes_mediano_plazo', 0, -1);
       const bloque30Texto = ultimos30.join('\n\n---\n\n');
@@ -126,30 +202,26 @@ ${bloque30Texto}
 `;
 
       const macroResponse = await ai.models.generateContent({
-        model: 'gemini-3.8-flash',
+        model: GEMINI_MODEL,
         contents: promptLargoPlazo,
       });
 
       const macroResumen = `[Época/Bloque de 30 streams hasta ${streamDate}]:\n${macroResponse.text.trim()}`;
 
-      // Guardamos el macro-resumen permanente y limpiamos la lista de mediano plazo
       await redis.lpush('memoria_largo_plazo', macroResumen);
       await redis.del('resumenes_mediano_plazo');
 
-      console.log(`[Consolidación] Memoria a largo plazo actualizada y lista de 30 días reiniciada.`);
+      console.log('[Consolidación] Memoria a largo plazo actualizada y lista de 30 días reiniciada.');
     }
-
   } catch (err) {
     console.error('[Resumen] Error en el proceso de resumen:', err);
   }
 }
 
-// Programación a las 2:05 PM (14:05)
-cron.schedule('5 14 * * *', () => {
-  const now = new Date();
-  now.setDate(now.getDate() - 1);
-  const fechaAProcesar = now.toISOString().split('T')[0];
-
+// Corre a las CUTOFF:05 en STREAM_TZ (14:05 por defecto)
+cron.schedule(`5 ${CUTOFF} * * *`, async () => {
+  await flushBuffer(); // asegura que todo lo pendiente esté guardado
+  const fechaAProcesar = getStreamDateKey(new Date(Date.now() - 24 * 60 * 60 * 1000));
   console.log(`[Cron] Activando tarea de resumen diario para: ${fechaAProcesar}`);
   resumirStreamAnterior(fechaAProcesar);
-});
+}, { timezone: STREAM_TZ });
